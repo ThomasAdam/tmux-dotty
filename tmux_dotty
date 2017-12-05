@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+
+# Copyright (c) 2017 Thomas Adam <thomas@xteddy.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
+# IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+# OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use strict;
+use warnings;
+
+use IPC::Run qw/run/;
+use IO::Handle;
+use Getopt::Std;
+
+use constant {
+	CURRENT_WIN_COLOUR	=> '#99FFFF',
+	PREV_WIN_COLOR 		=> '#FF99C2',
+	NORMAL_WIN_COLOR 	=> '#FF9999',
+	SESSION_ATTACHED_COLOUR	=> '#FFC299',
+	SESSION_DETACHED_COLOUR	=> '#9999FF',
+	PANE_COLOUR 		=> '#99FF99'
+};
+
+STDOUT->autoflush();
+my (%results, %opt);
+
+getopt('U:', \%opt);
+
+sub run_tmux_cmd
+{
+	my ($cmd) = @_;
+
+	my ($stdin, $stdout, $stderr);
+
+	# Copy any arguments passed through to us as arguments to the
+	# top-level tmux command.
+	my @ARGV_copy = @ARGV;
+	push @ARGV_copy, ';' if @ARGV_copy;
+
+	# Inject ARGV here so that any tmux options get passed through.
+	splice @$cmd, 1, 0, @ARGV_copy;
+
+	run($cmd, \$stdin, \$stdout, \$stderr) or die "@$cmd - $!";
+
+	return {
+		'output' => $stdout,
+		'error'  => $stderr,
+	};
+}
+
+sub _get_pane_info
+{
+	my ($pane_info) = @_;
+
+	my @p = split /\n/, $pane_info;
+	my @panes;
+
+	foreach (@p) {
+		my ($pane_index, $pane_id) = split /,/, $_;
+		
+		push @panes, {
+			pane_index => $pane_index,
+			pane_id    => $pane_id,
+		};
+	}
+
+	return \@panes;
+}
+
+sub _build_dotty_output
+{
+	my $dot_output = <<EOF;
+digraph T {
+	tmux [shape=box,center=true];
+	graph [center=true, margin=0.01, nodesep=0.1, ranksep=0.3,ratio=.75];
+        node [fixedsize=false];
+        node [margin=0.01];
+	edge [arrowType=open];
+EOF
+
+	foreach my $ses (keys %{ $results{'sessions'} }) {
+		my $attached = $results{'sessions'}->{$ses}->{'attached'};
+		my $colour = $attached ? SESSION_ATTACHED_COLOUR :
+			SESSION_DETACHED_COLOUR;
+		$dot_output .= "\ttmux -> {" . join ('; ',
+		"\"$ses\"[style=filled, color=\"$colour\"]") . "};\n";
+		foreach my $w (@{ $results{'sessions'}->{$ses}->{'windows'} }) {
+			my $panes = $w->{'panes'};
+			my $colour;
+			if ($w->{'label'} =~ /\*/) {
+				$colour = CURRENT_WIN_COLOUR;
+			} elsif ($w->{'label'} =~ /\-/) {
+				$colour = PREV_WIN_COLOR;
+			} else {
+				$colour = NORMAL_WIN_COLOR;
+			}
+
+			$dot_output .= "\t$ses -> {" . join ('; ',
+			"\"$w->{'name'}\"" .
+			"[label=\"" . $w->{'label'} . "\", style=filled, color=\"$colour\"]") . "};\n";
+
+			# Don't show panes if there's only one of them.
+			next if scalar @$panes == 1;
+
+			foreach my $p (@{$panes}) {
+				$dot_output .= "\t\"$w->{'name'}\" -> {" . join ('; ',
+				"\"pane$p->{'pane_id'}\"" .
+				"[label=\"pane\n" . $p->{'pane_id'} .
+				"\", style=filled, color=\"" . PANE_COLOUR . "\"]") . "};\n";
+			}
+		}
+	}
+	$dot_output .= "}";
+
+	print $dot_output, "\n";
+}
+
+my $s = run_tmux_cmd([ "tmux", "ls", "-F", "#{session_name},#{session_attached}" ]);
+my @ses = split /\n/, $s->{'output'};
+
+foreach my $ses_line (@ses) {
+	my ($session, $attached) = (split /,/, $ses_line, 2);
+	my $w = run_tmux_cmd([ "tmux", "lsw", "-F",
+		"#{window_index},#{window_name}#{window_flags},#{window_panes}",
+		"-t", $session]);
+	my @build = map {
+			my ($index, $name, $pane_count) = (split ',', $_);
+			my $panes = run_tmux_cmd(
+				[ "tmux", 
+			  	  "lsp",
+			  	  "-t", "$session:$index",
+			  	  "-F", "#{pane_index},#{pane_id}"
+				]
+			);
+			{
+				index => $index,
+				name => "${session}${index}${name}",
+				label => $name,
+				panes => _get_pane_info($panes->{'output'}),
+						
+			},
+	} split /\n/, $w->{'output'};
+
+	$results{'sessions'}{$session} = {
+		attached => $attached,
+		windows => \@build
+	};
+}
+
+if ($opt{'U'} and $opt{'U'} =~ /\d+/) {
+	while (1) {
+		sleep $opt{'U'};
+		_build_dotty_output();
+	}
+} else {
+	_build_dotty_output();
+}
